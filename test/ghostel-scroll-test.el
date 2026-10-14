@@ -358,14 +358,11 @@ not enough; the pixel offset must also be cleared."
             (ghostel--write-vt term "prompt> ")
             (ghostel--redraw term t)
             (set-window-buffer (selected-window) buf)
-            ;; Window was showing the viewport before the redraw — this
+            ;; Window was bottom-anchored before the redraw — this
             ;; is the auto-follow case where vscroll must be reset.
             (goto-char (point-max))
             (set-window-point (selected-window) (point-max))
-            (let ((vp-before (save-excursion
-                               (goto-char (point-max))
-                               (forward-line -9)
-                               (line-beginning-position))))
+            (let ((vp-before (car (ghostel--line-anchor (selected-window)))))
               (set-window-start (selected-window) vp-before t))
             ;; Seed a non-zero pixel vscroll (simulating what
             ;; `pixel-scroll-precision-mode' leaves behind).
@@ -403,17 +400,13 @@ windows must be anchored."
             (delete-other-windows)
             (set-window-buffer (selected-window) buf)
             (let ((w1 (selected-window))
-                  (w2 (split-window-vertically))
-                  (vp-before (save-excursion
-                               (goto-char (point-max))
-                               (forward-line -9)
-                               (line-beginning-position))))
+                  (w2 (split-window-vertically)))
               (set-window-buffer w2 buf)
               (set-window-point w1 (point-max))
               (set-window-point w2 (point-max))
-              ;; Both windows were at the viewport pre-redraw.
-              (set-window-start w1 vp-before t)
-              (set-window-start w2 vp-before t)
+              ;; Both windows were bottom-anchored pre-redraw.
+              (set-window-start w1 (car (ghostel--line-anchor w1)) t)
+              (set-window-start w2 (car (ghostel--line-anchor w2)) t)
               (puthash w1 7 vscroll-by-window)
               (puthash w2 4 vscroll-by-window)
               (cl-letf (((symbol-function 'set-window-vscroll)
@@ -449,10 +442,7 @@ a user reading history should not be pulled around by live redraws."
             ;; scroll-preservation logic is in steady state.
             (goto-char (point-max))
             (set-window-point (selected-window) (point-max))
-            (let ((vp (save-excursion
-                        (goto-char (point-max))
-                        (forward-line -9)
-                        (line-beginning-position))))
+            (let ((vp (car (ghostel--line-anchor (selected-window)))))
               (set-window-start (selected-window) vp t))
             (setq ghostel--force-next-redraw t)
             (ghostel--redraw-now buf)
@@ -492,10 +482,7 @@ anchored because the window is at the viewport) must update it."
             (set-window-buffer (selected-window) buf)
             (goto-char (point-max))
             (set-window-point (selected-window) (point-max))
-            (let ((vp (save-excursion
-                        (goto-char (point-max))
-                        (forward-line -9)
-                        (line-beginning-position))))
+            (let ((vp (car (ghostel--line-anchor (selected-window)))))
               (set-window-start (selected-window) vp t))
             ;; Simulate OSC 52;e leaving window-point stale.
             (set-window-point (selected-window) (point-min))
@@ -1179,6 +1166,138 @@ excludes it - the pad code must only measure with the pad cleared.
                 (ghostel--anchor-window (selected-window) t)
                 (should (= 2 ghostel--top-pad)))))
         (delete-window other)))))
+
+(defun ghostel-test-scroll--overscroll (win lines)
+  "Scroll WIN so it starts LINES lines above `point-max'.
+With LINES below WIN's height, WIN shows blank space past the last row."
+  (let ((start (save-excursion
+                 (goto-char (point-max))
+                 (forward-line (- lines))
+                 (point))))
+    (set-window-start win start t)
+    (set-window-point win (point-max))
+    start))
+
+(ert-deftest ghostel-test-window-follow-state-overscrolled ()
+  "A window scrolled below its bottom anchor is overscrolled, not anchored.
+The exact anchor and the partial-top-line start above it stay anchored."
+  :tags '(native)
+  (ghostel-test-scroll--with-buffer (buf term 10 40 200)
+    (let ((win (selected-window)))
+      (ghostel-test-scroll--write-lines term "scroll" 80)
+      (ghostel--redraw term t)
+      (ghostel-test-scroll--overscroll win 3)
+      (should (eq 'overscrolled (ghostel--window-follow-state win)))
+      (should-not (ghostel--window-anchored-p win))
+      (set-window-start win (car (ghostel--line-anchor win)) t)
+      (should (eq 'anchored (ghostel--window-follow-state win)))
+      (ghostel-test-scroll--set-gui-anchor-start win)
+      (should (ghostel--window-anchored-p win)))))
+
+(ert-deftest ghostel-test-past-bottom-anchor-compares-vscroll ()
+  "On the anchor's start line, only a vscroll beyond the anchor's is past it."
+  :tags '(native)
+  (ghostel-test-scroll--with-buffer (buf term 10 40 200)
+    (let ((win (selected-window))
+          (vscroll 0))
+      (ghostel-test-scroll--write-lines term "scroll" 80)
+      (ghostel--redraw term t)
+      (set-window-start win (car (ghostel--line-anchor win)) t)
+      (cl-letf (((symbol-function 'window-vscroll)
+                 (lambda (&rest _) vscroll)))
+        (should-not (ghostel--past-bottom-anchor-p win))
+        (setq vscroll 5)
+        (should (ghostel--past-bottom-anchor-p win))
+        (should (eq 'overscrolled (ghostel--window-follow-state win)))))))
+
+(ert-deftest ghostel-test-window-follow-state-point-min-stays-anchored ()
+  "A window starting at `point-min' over a short buffer stays anchored."
+  :tags '(native)
+  (ghostel-test-scroll--with-buffer (buf term 10 40 200)
+    (let ((win (selected-window)))
+      (ghostel-test-scroll--write-lines term "row" 3)
+      (ghostel--redraw term t)
+      (set-window-start win (point-min) t)
+      (set-window-point win (point-max))
+      (should (ghostel--window-anchored-p win))
+      ;; A pixel scroll below the first row still counts as anchored.
+      (cl-letf (((symbol-function 'window-vscroll)
+                 (lambda (&rest _) 5)))
+        (should (ghostel--past-bottom-anchor-p win))
+        (should (ghostel--window-anchored-p win))))))
+
+(ert-deftest ghostel-test-window-follow-state-cursor-line ()
+  "A start on the cursor's line is anchored only as a cursor clamp.
+Below the bottom anchor the same start is overscrolled."
+  :tags '(native)
+  (let ((orig-config (current-window-configuration)))
+    (unwind-protect
+        (ghostel-test-scroll--with-buffer (buf term 10 40 200)
+          (delete-other-windows)
+          (set-window-buffer (selected-window) buf)
+          (ghostel-test-scroll--write-lines term "scroll" 80)
+          (ghostel--write-vt term "prompt> ")
+          (ghostel--redraw term t)
+          (let ((win (selected-window))
+                (cursor-bol (save-excursion
+                              (goto-char ghostel--cursor-char-pos)
+                              (line-beginning-position))))
+            (set-window-start win cursor-bol t)
+            (set-window-point win ghostel--cursor-char-pos)
+            (should (eq 'overscrolled (ghostel--window-follow-state win)))
+            ;; Cursor at the grid's top row, in a window shorter than the
+            ;; grid: the anchor clamps to the cursor's line.
+            (ghostel--write-vt term "\e[H")
+            (ghostel--redraw term t)
+            (split-window win 4)
+            (ghostel--anchor-window win nil t)
+            (should (= (window-start win)
+                       (save-excursion
+                         (goto-char ghostel--cursor-char-pos)
+                         (line-beginning-position))))
+            (should (< (window-start win)
+                       (car (ghostel--line-anchor win))))
+            (should (ghostel--window-anchored-p win))))
+      (set-window-configuration orig-config))))
+
+(ert-deftest ghostel-test-redraw-keeps-overscrolled-window-until-filled ()
+  "Redraws keep an overscrolled window in place while output fills it.
+Once output fills the window down to its bottom anchor it follows again,
+even when one burst overshoots the blank space."
+  :tags '(native)
+  (ghostel-test-scroll--with-buffer (buf term 10 40 200)
+    (let* ((win (selected-window))
+           (_ (ghostel-test-scroll--write-lines term "scroll" 80))
+           (_ (ghostel--redraw term t))
+           (start (ghostel-test-scroll--overscroll win 3))
+           (start-text (save-excursion
+                         (goto-char start)
+                         (buffer-substring (point) (line-end-position)))))
+      (ghostel--write-vt term "extra-00\r\n")
+      (ghostel--redraw-now buf)
+      (should (equal start-text
+                     (save-excursion
+                       (goto-char (window-start win))
+                       (buffer-substring (point) (line-end-position)))))
+      (should (eq 'overscrolled (ghostel--window-follow-state win)))
+      (ghostel-test-scroll--write-lines term "burst" 40)
+      (ghostel--redraw-now buf)
+      (should (= (window-start win) (car (ghostel--line-anchor win))))
+      (should (ghostel--window-anchored-p win)))))
+
+(ert-deftest ghostel-test-minibuffer-exit-keeps-overscrolled-window ()
+  "Minibuffer exit does not schedule a re-anchor of an overscrolled window."
+  :tags '(native)
+  (ghostel-test-scroll--with-buffer (buf term 10 40 200)
+    (let ((win (selected-window))
+          scheduled)
+      (ghostel-test-scroll--write-lines term "scroll" 80)
+      (ghostel--redraw term t)
+      (ghostel-test-scroll--overscroll win 3)
+      (cl-letf (((symbol-function 'run-at-time)
+                 (lambda (&rest _) (setq scheduled t))))
+        (ghostel--minibuffer-exit))
+      (should-not scheduled))))
 
 (provide 'ghostel-scroll-test)
 ;;; ghostel-scroll-test.el ends here

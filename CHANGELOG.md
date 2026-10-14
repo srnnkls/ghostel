@@ -16,6 +16,11 @@ All notable changes to this project will be documented in this file.
   Emacs in live terminal-input modes.  A foreign deletion of rendered
   text is repaired by one full redraw after the command ends, and
   insertions made while that repair is pending are dropped with it.
+- A window pixel-scrolled past the last row (e.g. with ultra-scroll or
+  `pixel-scroll-precision-mode`) keeps its position across redraws
+  instead of snapping back to the bottom.  Output renders into the blank
+  space below the last row, and the window follows again once that
+  space is filled.
 
 ## [0.57.0] — 2026-10-09
 

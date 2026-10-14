@@ -4608,37 +4608,51 @@ carries no user intent); all other modes follow unless a region is active."
                (ghostel--line-mode-on-live-edge-p window)))
     (_ (not (region-active-p)))))
 
-(defun ghostel--window-anchored-p (window &optional body-pixel-height)
-  "Non-nil if WINDOW is scrolled to follow the live terminal output.
-WINDOW follows the output when the lines from its `window-start' to
+(defun ghostel--window-follow-state (window &optional body-pixel-height)
+  "Return how WINDOW tracks the live terminal output.
+WINDOW is near the output when the lines from its `window-start' to
 `point-max' fit within its body, measured from BODY-PIXEL-HEIGHT (default
 `window-body-height' in pixels, excluding the mode-line and header-line to
 match the terminal grid), plus one line of tolerance for the partial top
 line the graphical anchor leaves via `window-vscroll'.
 
 A cursor-clamped anchor (see `ghostel--anchor-window') can start above
-that geometric bound; WINDOW also counts as anchored while its
+that geometric bound; WINDOW is also near the output while its
 `window-start' sits exactly on the live cursor's line.
-WINDOW additionally follows only while `ghostel--window-follows-p'
-holds."
+
+Return `overscrolled' when such a WINDOW is scrolled below its bottom
+anchor (see `ghostel--past-bottom-anchor-p'), showing blank space past
+`point-max'; a WINDOW starting at `point-min' never is.  Return
+`anchored' for any other WINDOW near the output.  Both require
+`ghostel--window-follows-p'; return nil otherwise."
   (with-current-buffer (window-buffer window)
     (when (and (derived-mode-p 'ghostel-mode)
                (ghostel--window-follows-p window))
-      (or (and ghostel--cursor-char-pos
-               (not (eq ghostel--input-mode 'line))
-               (eql (window-start window)
-                    (save-excursion
-                      (goto-char ghostel--cursor-char-pos)
-                      (line-beginning-position))))
-          (when-let* ((dlh (with-selected-window window
-                             (default-line-height)))
-                      (body-pixel-height (or body-pixel-height
-                                             (window-body-height window t)))
-                      (screen-lines (/ (float body-pixel-height)
-                                       (float dlh)))
-                      (ws (window-start window))
-                      (ws-lines-to-end (count-lines ws (point-max))))
-            (<= ws-lines-to-end (1+ (floor screen-lines))))))))
+      (let ((ws (window-start window))
+            (body-pixel-height (or body-pixel-height
+                                   (window-body-height window t))))
+        (when (or (and ghostel--cursor-char-pos
+                       (not (eq ghostel--input-mode 'line))
+                       (eql ws (save-excursion
+                                 (goto-char ghostel--cursor-char-pos)
+                                 (line-beginning-position))))
+                  (when-let* ((dlh (with-selected-window window
+                                     (default-line-height)))
+                              (screen-lines (/ (float body-pixel-height)
+                                               (float dlh))))
+                    (<= (count-lines ws (point-max))
+                        (1+ (floor screen-lines)))))
+          (if (and (/= ws (point-min))
+                   (ghostel--past-bottom-anchor-p window body-pixel-height))
+              'overscrolled
+            'anchored))))))
+
+(defun ghostel--window-anchored-p (window &optional body-pixel-height)
+  "Non-nil if WINDOW is scrolled to follow the live terminal output.
+That is, `ghostel--window-follow-state' of WINDOW and BODY-PIXEL-HEIGHT
+is `anchored'.  An `overscrolled' WINDOW keeps its position until output
+fills it down to the bottom anchor."
+  (eq (ghostel--window-follow-state window body-pixel-height) 'anchored))
 
 (defun ghostel--anchored-windows (&optional buffer all-frames)
   "Return anchored Ghostel windows.
@@ -4681,16 +4695,50 @@ with IGNORE-LINE-AT-END (arity 7), so the arity probes for it; `fboundp'
 would not, since the function predates the form.  Emacs 28 falls back to
 line-count anchoring, exact for ghostel's uniform row heights.")
 
-(defun ghostel--pixel-anchor (window target)
+(defun ghostel--pixel-anchor (window target &optional body-height)
   "Return (START VSCROLL HEIGHT) anchoring TARGET at WINDOW's bottom.
 Ask Emacs redisplay for the exact pixel position that places TARGET at
-the bottom of WINDOW.  HEIGHT is the pixel height of START..TARGET."
-  (when-let* ((body-height (window-body-height window t))
+the bottom of WINDOW, whose body is BODY-HEIGHT pixels tall (default
+`window-body-height' in pixels).  HEIGHT is the pixel height of
+START..TARGET."
+  (when-let* ((body-height (or body-height (window-body-height window t)))
               ((> body-height 0))
               (size (window-text-pixel-size
                      window (cons target (- body-height)) target nil nil))
               (start (nth 2 size)))
     (list start (max 0 (- (nth 1 size) body-height)) (nth 1 size))))
+
+(defun ghostel--line-anchor (window &optional body-pixel-height)
+  "Return (START 0) anchoring `point-max' at WINDOW's bottom by line count.
+WINDOW's body is BODY-PIXEL-HEIGHT pixels tall (default its current
+height).  WINDOW's buffer must be current."
+  (save-excursion
+    (goto-char (point-max))
+    (forward-line
+     (- (if (bolp) 0 1)
+        (floor (with-selected-window window
+                 (if body-pixel-height
+                     (/ (float body-pixel-height)
+                        (float (default-line-height)))
+                   (window-screen-lines))))))
+    (list (point) 0)))
+
+(defun ghostel--past-bottom-anchor-p (window &optional body-pixel-height)
+  "Non-nil if WINDOW is scrolled below the anchor of `point-max'.
+The anchor is the one `ghostel--anchor-window' would set for a body
+BODY-PIXEL-HEIGHT pixels tall: the pixel anchor in graphical frames, the
+line anchor otherwise.  WINDOW is past it when its `window-start' lies
+below the anchor's start, or on it with a larger `window-vscroll'.
+WINDOW's buffer must be current."
+  (when-let* ((anchor (or (and (display-graphic-p (window-frame window))
+                               ghostel--pixel-anchor-supported-p
+                               (ghostel--pixel-anchor
+                                window (point-max) body-pixel-height))
+                          (ghostel--line-anchor window body-pixel-height)))
+              (ws (window-start window)))
+    (or (> ws (car anchor))
+        (and (= ws (car anchor))
+             (> (window-vscroll window t) (nth 1 anchor))))))
 
 (defun ghostel--top-pad-set (pad)
   "Pad PAD pixels above the first row; 0 removes the pad.
@@ -4791,11 +4839,7 @@ line mode keeps the user's point."
                (anchor (or (and (display-graphic-p (window-frame window))
                                 ghostel--pixel-anchor-supported-p
                                 (ghostel--balance-top-pad window target))
-                           (save-excursion
-                             (goto-char target)
-                             (forward-line
-                              (- (if (bolp) 0 1) (floor (window-screen-lines))))
-                             (list (point) 0))))
+                           (ghostel--line-anchor window)))
                (start (if (and cursor-bol (< cursor-bol (car anchor)))
                           cursor-bol
                         (car anchor)))
@@ -4846,7 +4890,10 @@ them during synchronized output or when BUFFER has no render window."
           ;; before the snapshot so a pause can take ownership of its input.
           (ghostel--line-mode-pre-redraw)
           (let (rendered)
-            (let* ((anchored (ghostel--anchored-windows buffer t))
+            (let* ((follow-states
+                    (mapcar (lambda (win)
+                              (cons win (ghostel--window-follow-state win)))
+                            (ghostel--windows buffer t)))
                    ;; Line-mode input is not part of libghostty's grid.  Remove
                    ;; it while native rendering runs, then restore it after
                    ;; rendering.
@@ -4873,7 +4920,13 @@ them during synchronized output or when BUFFER has no render window."
               ;; FOLLOWING=t: the render advanced the cursor while preserving
               ;; window-point, so the pre-render snapshot carries the Emacs-mode
               ;; follow decision.
-              (dolist (win anchored) (ghostel--anchor-window win nil t))
+              ;; An overscrolled window keeps its position while output fills
+              ;; the blank space below `point-max', and follows once filled.
+              (pcase-dolist (`(,win . ,state) follow-states)
+                (when (or (eq state 'anchored)
+                          (and (eq state 'overscrolled)
+                               (not (ghostel--past-bottom-anchor-p win))))
+                  (ghostel--anchor-window win nil t)))
               (let ((line-restored
                      (and line-snapshot
                           (ghostel--line-mode-restore line-snapshot))))
